@@ -100,6 +100,68 @@ def main() -> None:
         body,
     )
 
+    # --- controller_steps_mm: fixed-step quantization ---------------------
+    steps = {"x": 0.5, "y": 0.5, "z": 0.5}
+
+    # (a) millimetre absolute moves snap to the 0.5 mm grid.
+    request = dict(base_request, controller_steps_mm=steps,
+                   program="G21 G90 G0 X0.6 Y0.9\nG1 X1.2 Z0.25")
+    status, body = http("POST", "/api/toolpaths/audit", request)
+    check("mm absolute program with steps accepted", status == 200, body)
+    check(
+        "mm absolute endpoints are on-grid",
+        body["segments"][0]["end"] == {"x": "0.5", "y": "1", "z": "0"}
+        and body["segments"][1]["end"] == {"x": "1", "y": "1", "z": "0.5"}
+        and body["final_position_mm"] == {"x": "1", "y": "1", "z": "0.5"},
+        body.get("segments"),
+    )
+
+    # (b) inch relative moves: displacement rounds per line and accumulates
+    # from the previous quantized actual position. 10 mm grid:
+    # +1in=25.4 -> 30; -0.5in=-12.7 -> -10, reaching 20; 0.25in on y
+    # = 6.35 -> 10.
+    request = dict(base_request,
+                   controller_steps_mm={"x": 10, "y": 10, "z": 10},
+                   program="G20 G91 G0 X1\nG1 X-0.5 Y0.25")
+    status, body = http("POST", "/api/toolpaths/audit", request)
+    check("inch relative program with steps accepted", status == 200, body)
+    check(
+        "inch relative displacements snap then accumulate",
+        body["final_position_mm"] == {"x": "20", "y": "10", "z": "0"}
+        and body["segments"][0]["end"] == {"x": "30", "y": "0", "z": "0"}
+        and body["segments"][1]["start"] == {"x": "30", "y": "0", "z": "0"},
+        body.get("segments"),
+    )
+
+    # (c) exact half step on a negative move rounds away from zero.
+    request = dict(base_request, controller_steps_mm={"x": 1, "y": 1, "z": 1},
+                   program="G21 G91 G0 X-0.5\nG1 X0.25")
+    status, body = http("POST", "/api/toolpaths/audit", request)
+    check("negative half-step program accepted", status == 200, body)
+    check(
+        "negative half step rounds away from zero",
+        body["segments"][0]["end"]["x"] == "-1"
+        and body["final_position_mm"]["x"] == "-1",
+        body.get("segments"),
+    )
+
+    # Off-grid initial position is a 400 request error.
+    bad_request = dict(base_request, controller_steps_mm=steps,
+                       initial_position_mm={"x": 0.2, "y": 0, "z": 0},
+                       program="G21 G90 G0 X1")
+    status, body = http("POST", "/api/toolpaths/audit", bad_request)
+    check("off-grid initial position rejected as request error",
+          status == 400 and body.get("error") == "invalid_request", body)
+
+    # (d) regression: omitting controller_steps_mm keeps the ideal contract.
+    request = dict(base_request, program="G21 G90 G0 X0.333\nG1 X1.777")
+    status, body = http("POST", "/api/toolpaths/audit", request)
+    check("ideal coordinates returned unchanged when steps omitted",
+          status == 200
+          and body["final_position_mm"] == {"x": "1.777", "y": "0", "z": "0"}
+          and "controller_steps_mm" not in request,
+          body)
+
     print("smoke OK")
 
 

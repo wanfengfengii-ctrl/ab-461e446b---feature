@@ -21,6 +21,13 @@ Semantics:
   effect *for that line* (G20 on the line already applies).
 * Coordinates without any motion mode established are an error.
 * A line that only sets modal state produces no movement.
+
+When ``steps_mm`` is supplied (positive per-axis millimetre grid pitches),
+each commanded coordinate is quantized *after* the line's unit and position
+mode are applied: an absolute target is rounded to the nearest grid multiple,
+while a relative move has its displacement rounded and then added to the
+previous (already quantized) actual position.  An exact half step is rounded
+away from zero.  Axes absent from the line never move.
 """
 
 from __future__ import annotations
@@ -175,11 +182,31 @@ def _parse_line(line_number: int, raw_line: str) -> tuple[
     return unit, position, motion, axes
 
 
+def _round_to_steps(value: Fraction, step: Fraction) -> Fraction:
+    """Round ``value`` to the nearest multiple of ``step``.
+
+    An exact half step rounds away from zero (so both absolute targets and
+    relative displacements get the same sign-preserving tie rule).
+    """
+    magnitude = abs(value)
+    quotient, remainder = divmod(magnitude, step)  # floor quotient, 0 <= r < step
+    if remainder * 2 >= step:  # exact half (or above) -> away from zero
+        quotient += 1
+    result = quotient * step
+    return -result if value < 0 else result
+
+
 def execute(
     program_text: str,
     initial_mm: tuple[Fraction, Fraction, Fraction],
+    steps_mm: Optional[tuple[Fraction, Fraction, Fraction]] = None,
 ) -> tuple[list[Move], tuple[Fraction, Fraction, Fraction]]:
-    """Interpret the program and return (normalized mm segments, final mm point)."""
+    """Interpret the program and return (normalized mm segments, final mm point).
+
+    With ``steps_mm`` set, every commanded axis value is snapped to that
+    axis' step grid (see module docs); the returned segments and final point
+    then describe what a fixed-step controller would physically execute.
+    """
     unit: Optional[str] = None  # "G20" inch, "G21" mm
     position: Optional[str] = None  # "G90" absolute, "G91" relative
     motion: Optional[str] = None  # "G0" rapid, "G1" feed
@@ -227,11 +254,16 @@ def execute(
             target = list(point)
             for axis_index, axis_name in enumerate(_AXES):
                 if axis_name not in axes:
+                    # Unspecified axes keep the actual (quantized) position.
                     continue
                 value_mm = axes[axis_name] * scale
                 if position == "G90":
+                    if steps_mm is not None:
+                        value_mm = _round_to_steps(value_mm, steps_mm[axis_index])
                     target[axis_index] = value_mm
                 else:
+                    if steps_mm is not None:
+                        value_mm = _round_to_steps(value_mm, steps_mm[axis_index])
                     target[axis_index] = point[axis_index] + value_mm
             target_tuple = (target[0], target[1], target[2])
 
