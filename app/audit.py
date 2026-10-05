@@ -28,9 +28,33 @@ def _point_from_payload(payload: Any, field: str) -> PointT:
             raise AuditError(f"{field}.{axis} is required")
         try:
             dec = coerce_decimal(payload[axis], f"{field}.{axis}")
+            values.append(decimal_to_fraction(dec))
         except ValueError as exc:
             raise AuditError(str(exc)) from None
-        values.append(decimal_to_fraction(dec))
+    return (values[0], values[1], values[2])
+
+
+def _steps_from_payload(payload: Any) -> PointT:
+    """Validate the optional controller_steps_mm object.
+
+    All three axes must be present and hold a positive canonical decimal
+    step in millimetres.
+    """
+    field = "controller_steps_mm"
+    if not isinstance(payload, dict):
+        raise AuditError(f"{field} must be an object with x, y, z")
+    values: list[Fraction] = []
+    for axis in ("x", "y", "z"):
+        if axis not in payload:
+            raise AuditError(f"{field}.{axis} is required")
+        try:
+            dec = coerce_decimal(payload[axis], f"{field}.{axis}")
+            step = decimal_to_fraction(dec)
+        except ValueError as exc:
+            raise AuditError(str(exc)) from None
+        if step <= 0:
+            raise AuditError(f"{field}.{axis} must be a positive decimal")
+        values.append(step)
     return (values[0], values[1], values[2])
 
 
@@ -65,6 +89,7 @@ def _validate_request(data: Any) -> tuple[
     tuple[PointT, PointT],
     list[tuple[PointT, PointT]],
     str,
+    PointT | None,
 ]:
     if not isinstance(data, dict):
         raise AuditError("request body must be a JSON object")
@@ -80,6 +105,16 @@ def _validate_request(data: Any) -> tuple[
     for axis_i in range(3):
         if not (ws_lo[axis_i] <= initial_mm[axis_i] <= ws_hi[axis_i]):
             raise AuditError("initial_position_mm must lie within the closed workspace")
+
+    steps_mm: PointT | None = None
+    if "controller_steps_mm" in data:
+        steps_mm = _steps_from_payload(data["controller_steps_mm"])
+        for axis_i in range(3):
+            if initial_mm[axis_i] % steps_mm[axis_i] != 0:
+                raise AuditError(
+                    "initial_position_mm must lie on the controller step grid "
+                    "when controller_steps_mm is given"
+                )
 
     raw_regions = data.get("forbidden_regions", [])
     if not isinstance(raw_regions, list):
@@ -97,7 +132,7 @@ def _validate_request(data: Any) -> tuple[
     if len(program.splitlines()) > MAX_PROGRAM_LINES:
         raise AuditError(f"program may contain at most {MAX_PROGRAM_LINES} lines")
 
-    return initial_mm, workspace, regions, program
+    return initial_mm, workspace, regions, program, steps_mm
 
 
 def _serialise_segment(move: Move) -> dict:
@@ -120,12 +155,13 @@ def audit(data: Any) -> tuple[dict | None, dict | None]:
     On any failure no dispatchable partial toolpath is ever returned.
     """
     try:
-        initial_mm, workspace, regions, program_text = _validate_request(data)
+        initial_mm, workspace, regions, program_text, steps_mm = \
+            _validate_request(data)
     except AuditError as exc:
         return None, {"error": "invalid_request", "reason": str(exc)}
 
     try:
-        moves, final_point = execute(program_text, initial_mm)
+        moves, final_point = execute(program_text, initial_mm, steps_mm)
     except ProgramError as exc:
         # An earlier line may already violate the geometry; the first
         # violation in program order wins over a later lexical error.

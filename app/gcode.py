@@ -25,6 +25,7 @@ Semantics:
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from fractions import Fraction
@@ -58,7 +59,11 @@ _TOKEN_RE = re.compile(
 
 @dataclass(frozen=True)
 class Move:
-    """One normalized straight segment in millimetres."""
+    """One normalized straight segment in millimetres.
+
+    When controller steps are configured the endpoints are already quantized
+    to the step grid, i.e. this is exactly what the controller will execute.
+    """
 
     start: tuple[Fraction, Fraction, Fraction]
     end: tuple[Fraction, Fraction, Fraction]
@@ -175,11 +180,30 @@ def _parse_line(line_number: int, raw_line: str) -> tuple[
     return unit, position, motion, axes
 
 
+def quantize_to_step(value: Fraction, step: Fraction) -> Fraction:
+    """Round ``value`` to the nearest multiple of ``step`` (exact).
+
+    A value lying exactly on a half step rounds away from zero.  All
+    arithmetic stays rational, so grid points are reproduced bit-exactly.
+    """
+    ratio = value / step
+    if ratio >= 0:
+        return math.floor(ratio + Fraction(1, 2)) * step
+    return -math.floor(-ratio + Fraction(1, 2)) * step
+
+
 def execute(
     program_text: str,
     initial_mm: tuple[Fraction, Fraction, Fraction],
+    steps_mm: Optional[tuple[Fraction, Fraction, Fraction]] = None,
 ) -> tuple[list[Move], tuple[Fraction, Fraction, Fraction]]:
-    """Interpret the program and return (normalized mm segments, final mm point)."""
+    """Interpret the program and return (normalized mm segments, final mm point).
+
+    When ``steps_mm`` is given, each line's absolute coordinate (G90) or
+    relative displacement (G91) is quantized to that axis' step grid before
+    being applied; relative moves then accumulate from the previous
+    *quantized* position, so the returned trajectory is the dispatchable one.
+    """
     unit: Optional[str] = None  # "G20" inch, "G21" mm
     position: Optional[str] = None  # "G90" absolute, "G91" relative
     motion: Optional[str] = None  # "G0" rapid, "G1" feed
@@ -229,6 +253,11 @@ def execute(
                 if axis_name not in axes:
                     continue
                 value_mm = axes[axis_name] * scale
+                if steps_mm is not None:
+                    # G90: quantize the absolute coordinate; G91: the
+                    # displacement, which is then added to the (already
+                    # quantized) actual position.
+                    value_mm = quantize_to_step(value_mm, steps_mm[axis_index])
                 if position == "G90":
                     target[axis_index] = value_mm
                 else:

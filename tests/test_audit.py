@@ -13,14 +13,18 @@ from app.server import create_app
 # ---------------------------------------------------------------------------
 
 def run(program, regions=None, initial=(0, 0, 0),
-        ws_min=(-100, -100, -100), ws_max=(100, 100, 100)):
-    return audit({
+        ws_min=(-100, -100, -100), ws_max=(100, 100, 100), steps=None):
+    payload = {
         "initial_position_mm": {"x": initial[0], "y": initial[1], "z": initial[2]},
         "workspace": {"min": {"x": ws_min[0], "y": ws_min[1], "z": ws_min[2]},
                       "max": {"x": ws_max[0], "y": ws_max[1], "z": ws_max[2]}},
         "forbidden_regions": regions or [],
         "program": program,
-    })
+    }
+    if steps is not None:
+        payload["controller_steps_mm"] = {"x": steps[0], "y": steps[1],
+                                          "z": steps[2]}
+    return audit(payload)
 
 
 def box(mn, mx):
@@ -343,6 +347,157 @@ def test_failure_never_returns_segments():
 
 
 # ---------------------------------------------------------------------------
+# controller_steps_mm: quantization to the controller step grid
+# ---------------------------------------------------------------------------
+
+def test_steps_mm_absolute_motion_quantized():
+    # 10.3/0.5 = 20.6 -> 21 steps; 20.4 -> 20; 2.9/2 = 1.45 -> 1 step.
+    ok, err = run("G21 G90 G0 X10.3 Y20.4 Z2.9", steps=("0.5", "1", "2"))
+    assert err is None
+    assert ok["segments"] == [
+        {"start": {"x": "0", "y": "0", "z": "0"},
+         "end": {"x": "10.5", "y": "20", "z": "2"}, "motion": "G0", "line": 1},
+    ]
+    assert ok["final_position_mm"] == {"x": "10.5", "y": "20", "z": "2"}
+
+
+def test_steps_inch_relative_motion_quantized():
+    # 0.5 in = 12.7 mm -> 13; 0.25 in = 6.35 mm -> 6; -0.25 in -> -6.
+    ok, err = run("G20 G91 G0 X0.5 Y0.25\nG1 X-0.25", steps=(1, 1, 1))
+    assert err is None
+    assert ok["segments"][0]["end"] == {"x": "13", "y": "6", "z": "0"}
+    assert ok["segments"][1]["start"] == {"x": "13", "y": "6", "z": "0"}
+    assert ok["segments"][1]["end"] == {"x": "7", "y": "6", "z": "0"}
+    assert ok["final_position_mm"] == {"x": "7", "y": "6", "z": "0"}
+
+
+def test_steps_half_step_rounds_away_from_zero():
+    ok, err = run("G21 G91 G0 X-0.5", initial=(10, 0, 0), steps=(1, 1, 1))
+    assert err is None
+    assert ok["final_position_mm"]["x"] == "9"
+    ok, err = run("G21 G91 G0 X0.5", initial=(10, 0, 0), steps=(1, 1, 1))
+    assert ok["final_position_mm"]["x"] == "11"
+    # Absolute coordinates round the same way, including negative halves.
+    ok, err = run("G21 G90 G0 X-0.5", steps=(1, 1, 1))
+    assert ok["final_position_mm"]["x"] == "-1"
+    ok, err = run("G21 G90 G0 X-1.5 Y2.5", steps=(1, 1, 1))
+    assert ok["final_position_mm"] == {"x": "-2", "y": "3", "z": "0"}
+    ok, err = run("G21 G91 G0 X-1.5", initial=(10, 0, 0), steps=(1, 1, 1))
+    assert ok["final_position_mm"]["x"] == "8"
+
+
+def test_steps_relative_moves_accumulate_from_quantized_position():
+    # Each 0.6 mm displacement rounds to 1 mm; accumulating from the
+    # quantized position gives 2, not round(1.2) = 1.
+    ok, err = run("G21 G91 G0 X0.6\nG1 X0.6", steps=(1, 1, 1))
+    assert err is None
+    assert ok["segments"][0]["end"]["x"] == "1"
+    assert ok["segments"][1]["start"]["x"] == "1"
+    assert ok["final_position_mm"]["x"] == "2"
+
+
+def test_steps_unmentioned_axes_keep_actual_position():
+    ok, err = run("G21 G90 G0 X2.4", initial=(1, 2, 3), steps=(1, 1, 1))
+    assert err is None
+    assert ok["final_position_mm"] == {"x": "2", "y": "2", "z": "3"}
+
+
+def test_steps_move_quantized_to_zero_emits_no_segment():
+    ok, err = run("G21 G91 G0 X0.3", steps=(1, 1, 1))
+    assert err is None
+    assert ok["segments"] == []
+    assert ok["final_position_mm"] == {"x": "0", "y": "0", "z": "0"}
+
+
+def test_steps_zero_displacement_still_geometry_checked():
+    region = box((-1, -1, -1), (1, 1, 1))
+    ok, err = run("G21 G91 G0 X0.3", regions=[region], steps=(1, 1, 1))
+    assert ok is None
+    assert err["error"] == "forbidden_contact"
+    assert err["line"] == 1
+
+
+def test_steps_initial_position_off_grid_rejected():
+    ok, err = run("G21 G90 G0 X1", initial=(0.3, 0, 0), steps=("0.5", "1", "1"))
+    assert ok is None
+    assert err["error"] == "invalid_request"
+    ok, err = run("G21 G90 G0 X1", initial=(0, 0, "0.25"),
+                  steps=("0.5", "1", "0.5"))
+    assert err["error"] == "invalid_request"
+    # Negative grid points are fine when exactly on the grid.
+    ok, err = run("G21 G90 G0 X1", initial=("-1.5", 0, 0),
+                  steps=("0.5", "1", "1"))
+    assert err is None
+
+
+def test_steps_validation_errors():
+    bad_payloads = [
+        {},                                   # missing axes
+        {"x": 1, "y": 1},                     # missing z
+        {"x": 0, "y": 1, "z": 1},             # zero step
+        {"x": 1, "y": "-0.5", "z": 1},        # negative step
+        {"x": "1_0", "y": 1, "z": 1},         # non-canonical decimal
+        {"x": True, "y": 1, "z": 1},          # boolean
+        None,                                 # not an object
+        [1, 1, 1],                            # not an object
+    ]
+    for bad in bad_payloads:
+        payload = {
+            "initial_position_mm": {"x": 0, "y": 0, "z": 0},
+            "workspace": {"min": {"x": -10, "y": -10, "z": -10},
+                          "max": {"x": 10, "y": 10, "z": 10}},
+            "forbidden_regions": [],
+            "program": "G21 G90 G0 X1",
+            "controller_steps_mm": bad,
+        }
+        ok, err = audit(payload)
+        assert ok is None
+        assert err["error"] == "invalid_request", bad
+
+
+def test_steps_quantized_path_contacting_fixture_is_rejected():
+    # Ideal endpoint 4.5 clears the box; the quantized endpoint 5 is inside.
+    region = box((4.75, -1, -1), (5.25, 1, 1))
+    ok, err = run("G21 G90 G0 X4.5 Y0 Z0", regions=[region])
+    assert err is None  # legacy ideal-coordinate audit passes
+    ok, err = run("G21 G90 G0 X4.5 Y0 Z0", regions=[region], steps=(1, 1, 1))
+    assert ok is None
+    assert err["error"] == "forbidden_contact"
+    assert err["line"] == 1
+    assert err["forbidden_region"] == 1
+    assert "segments" not in err
+
+
+def test_steps_quantized_path_checked_against_workspace():
+    # Ideal 9.6 is inside the workspace; quantized 10 is not.
+    ok, err = run("G21 G90 G0 X9.6", ws_max=(9.8, 100, 100))
+    assert err is None
+    ok, err = run("G21 G90 G0 X9.6", ws_max=(9.8, 100, 100), steps=(1, 1, 1))
+    assert ok is None
+    assert err["error"] == "outside_workspace"
+    assert err["line"] == 1
+
+
+def test_steps_quantization_can_avoid_fixture():
+    # Ideal 5.2 touches the box; the quantized endpoint 5 is clear.
+    region = box((5.1, -1, -1), (5.9, 1, 1))
+    ok, err = run("G21 G90 G0 X5.2", regions=[region])
+    assert err is not None and err["error"] == "forbidden_contact"
+    ok, err = run("G21 G90 G0 X5.2", regions=[region], steps=(1, 1, 1))
+    assert err is None
+    assert ok["final_position_mm"] == {"x": "5", "y": "0", "z": "0"}
+
+
+def test_steps_first_violation_line_still_reported():
+    region = box((4.75, -1, -1), (5.25, 1, 1))
+    program = "G21 G90 G0 X1\nG1 X4.5\nG1 X-50"
+    ok, err = run(program, regions=[region], steps=(1, 1, 1))
+    assert ok is None
+    assert err["error"] == "forbidden_contact"
+    assert err["line"] == 2
+
+
+# ---------------------------------------------------------------------------
 # HTTP layer
 # ---------------------------------------------------------------------------
 
@@ -387,3 +542,42 @@ def test_audit_endpoint_malformed_json(client):
     resp = client.post("/api/toolpaths/audit", data="not json",
                        content_type="application/json")
     assert resp.status_code == 400
+
+
+def test_audit_endpoint_steps_quantized_success(client):
+    resp = client.post("/api/toolpaths/audit", json={
+        "initial_position_mm": {"x": 0, "y": 0, "z": 0},
+        "workspace": {"min": {"x": -100, "y": -100, "z": -100},
+                      "max": {"x": 100, "y": 100, "z": 100}},
+        "forbidden_regions": [],
+        "controller_steps_mm": {"x": "0.5", "y": "1", "z": "2"},
+        "program": "G21 G90 G0 X10.3 Y20.4 Z2.9",
+    })
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["final_position_mm"] == {"x": "10.5", "y": "20", "z": "2"}
+
+
+def test_audit_endpoint_off_grid_initial_is_400(client):
+    resp = client.post("/api/toolpaths/audit", json={
+        "initial_position_mm": {"x": "0.3", "y": 0, "z": 0},
+        "workspace": {"min": {"x": -100, "y": -100, "z": -100},
+                      "max": {"x": 100, "y": 100, "z": 100}},
+        "forbidden_regions": [],
+        "controller_steps_mm": {"x": "0.5", "y": "1", "z": "1"},
+        "program": "G21 G90 G0 X1",
+    })
+    assert resp.status_code == 400
+    assert resp.get_json()["error"] == "invalid_request"
+
+
+def test_extreme_exponent_in_payload_is_invalid_request_not_500(client):
+    resp = client.post("/api/toolpaths/audit", json={
+        "initial_position_mm": {"x": "1e1001", "y": 0, "z": 0},
+        "workspace": {"min": {"x": -10, "y": -10, "z": -10},
+                      "max": {"x": 10, "y": 10, "z": 10}},
+        "forbidden_regions": [],
+        "program": "G21 G90 G0 X1",
+    })
+    assert resp.status_code == 400
+    assert resp.get_json()["error"] == "invalid_request"
